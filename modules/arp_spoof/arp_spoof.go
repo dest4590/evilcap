@@ -2,6 +2,7 @@ package arp_spoof
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand"
 	"net"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/dest4590/evilcap/v2/packets"
 	"github.com/dest4590/evilcap/v2/session"
 
+	"github.com/evilsocket/islazy/tui"
 	"github.com/malfunkt/iprange"
 )
 
@@ -29,6 +31,7 @@ type ArpSpoofer struct {
 	random      bool
 	interval    time.Duration
 	waitGroup   *sync.WaitGroup
+	targetMu    sync.RWMutex
 }
 
 func NewArpSpoofer(s *session.Session) *ArpSpoofer {
@@ -123,6 +126,24 @@ func NewArpSpoofer(s *session.Session) *ArpSpoofer {
 		"Stop ARP spoofer.",
 		func(args []string) error {
 			return mod.Stop()
+		}))
+
+	mod.AddHandler(session.NewModuleHandler("arp.spoof show", "",
+		"Show active spoofing targets.",
+		func(args []string) error {
+			return mod.showTargets()
+		}))
+
+	mod.AddHandler(session.NewModuleHandler("arp.spoof.add TARGET", `arp\.spoof\.add (.+)`,
+		"Add TARGET to the ARP spoofing targets while the module is running.",
+		func(args []string) error {
+			return mod.addTarget(args[0])
+		}))
+
+	mod.AddHandler(session.NewModuleHandler("arp.spoof.rm TARGET", `arp\.spoof\.rm (.+)`,
+		"Remove TARGET from the ARP spoofing targets while the module is running.",
+		func(args []string) error {
+			return mod.removeTarget(args[0])
 		}))
 
 	return mod
@@ -244,7 +265,10 @@ func (mod *ArpSpoofer) Start() error {
 
 func (mod *ArpSpoofer) unSpoof() error {
 	if !mod.skipRestore {
+		mod.targetMu.RLock()
 		nTargets := len(mod.addresses) + len(mod.macs)
+		mod.targetMu.RUnlock()
+
 		mod.Info("restoring ARP cache of %d targets.", nTargets)
 		mod.arpSpoofTargets(mod.Session.Gateway.IP, mod.Session.Gateway.HW, false, false)
 
@@ -294,8 +318,15 @@ func (mod *ArpSpoofer) isWhitelisted(ip string, mac net.HardwareAddr) bool {
 func (mod *ArpSpoofer) getTargets(probe bool) map[string]net.HardwareAddr {
 	targets := make(map[string]net.HardwareAddr)
 
+	mod.targetMu.RLock()
+	addresses := make([]net.IP, len(mod.addresses))
+	copy(addresses, mod.addresses)
+	macs := make([]net.HardwareAddr, len(mod.macs))
+	copy(macs, mod.macs)
+	mod.targetMu.RUnlock()
+
 	// add targets specified by IP address
-	for _, ip := range mod.addresses {
+	for _, ip := range addresses {
 		if mod.Session.Skip(ip) {
 			continue
 		}
@@ -305,7 +336,7 @@ func (mod *ArpSpoofer) getTargets(probe bool) map[string]net.HardwareAddr {
 		}
 	}
 	// add targets specified by MAC address
-	for _, hw := range mod.macs {
+	for _, hw := range macs {
 		if ip, err := network.ArpInverseLookup(mod.Session.Interface.Name(), hw.String(), false); err == nil {
 			if mod.Session.Skip(net.ParseIP(ip)) {
 				continue
@@ -385,4 +416,127 @@ func (mod *ArpSpoofer) arpSpoofTargets(saddr net.IP, smac net.HardwareAddr, chec
 			}
 		}
 	}
+}
+
+// showTargets prints the currently active ARP spoofing targets.
+func (mod *ArpSpoofer) showTargets() error {
+	mod.targetMu.RLock()
+	defer mod.targetMu.RUnlock()
+
+	nTargets := len(mod.addresses) + len(mod.macs)
+	if nTargets == 0 {
+		mod.Info("no active spoofing targets.")
+		return nil
+	}
+
+	mod.Info("active spoofing targets (%d):", nTargets)
+	for _, ip := range mod.addresses {
+		mod.Info("  %s %s", tui.Bold(ip.String()), tui.Dim("(IP)"))
+	}
+	for _, hw := range mod.macs {
+		mod.Info("  %s %s", tui.Bold(hw.String()), tui.Dim("(MAC)"))
+	}
+	return nil
+}
+
+// addTarget parses a target string and appends it to the live addresses/macs
+// lists so the running spoof loop picks it up on the next tick.
+func (mod *ArpSpoofer) addTarget(target string) error {
+	newAddrs, newMacs, err := network.ParseTargets(target, mod.Session.Lan.Aliases())
+	if err != nil {
+		return fmt.Errorf("could not parse target %q: %v", target, err)
+	}
+	if len(newAddrs)+len(newMacs) == 0 {
+		return fmt.Errorf("no valid targets found in %q", target)
+	}
+
+	mod.targetMu.Lock()
+	defer mod.targetMu.Unlock()
+
+	for _, ip := range newAddrs {
+		dup := false
+		for _, existing := range mod.addresses {
+			if existing.Equal(ip) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			mod.addresses = append(mod.addresses, ip)
+			mod.Info("added %s to ARP spoof targets", tui.Bold(ip.String()))
+		} else {
+			mod.Warning("%s is already in the targets list", ip.String())
+		}
+	}
+	for _, hw := range newMacs {
+		dup := false
+		for _, existing := range mod.macs {
+			if bytes.Equal(existing, hw) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			mod.macs = append(mod.macs, hw)
+			mod.Info("added %s to ARP spoof targets", tui.Bold(hw.String()))
+		} else {
+			mod.Warning("%s is already in the targets list", hw.String())
+		}
+	}
+	return nil
+}
+
+// removeTarget removes a target (IP or MAC) from the live lists and immediately
+// restores the ARP entry of the removed target.
+func (mod *ArpSpoofer) removeTarget(target string) error {
+	rmAddrs, rmMacs, err := network.ParseTargets(target, mod.Session.Lan.Aliases())
+	if err != nil {
+		return fmt.Errorf("could not parse target %q: %v", target, err)
+	}
+	if len(rmAddrs)+len(rmMacs) == 0 {
+		return fmt.Errorf("no valid targets found in %q", target)
+	}
+
+	mod.targetMu.Lock()
+	defer mod.targetMu.Unlock()
+
+	for _, rmIP := range rmAddrs {
+		newList := mod.addresses[:0]
+		removed := false
+		for _, ip := range mod.addresses {
+			if ip.Equal(rmIP) {
+				removed = true
+			} else {
+				newList = append(newList, ip)
+			}
+		}
+		mod.addresses = newList
+		if removed {
+			mod.Info("removed %s from ARP spoof targets", tui.Bold(rmIP.String()))
+			// restore the ARP entry for this host
+			if realMAC, err := mod.Session.FindMAC(rmIP, false); err == nil {
+				mod.arpSpoofTargets(mod.Session.Gateway.IP, realMAC, false, false)
+			}
+		} else {
+			mod.Warning("%s was not found in the targets list", rmIP.String())
+		}
+	}
+	for _, rmHW := range rmMacs {
+		newList := mod.macs[:0]
+		removed := false
+		for _, hw := range mod.macs {
+			if bytes.Equal(hw, rmHW) {
+				removed = true
+			} else {
+				newList = append(newList, hw)
+			}
+		}
+		mod.macs = newList
+		if removed {
+			mod.Info("removed %s from ARP spoof targets", tui.Bold(rmHW.String()))
+		} else {
+			mod.Warning("%s was not found in the targets list", rmHW.String())
+		}
+	}
+	return nil
 }

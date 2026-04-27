@@ -230,12 +230,19 @@ func matchByAddress(iface net.Interface, name string) bool {
 func findInterfaceByName(name string, ifaces []net.Interface) (*Endpoint, error) {
 	for _, iface := range ifaces {
 		ifName := getInterfaceName(iface)
+
 		if ifName == name || matchByAddress(iface, name) {
 			return buildEndpointFromInterface(iface)
 		}
 	}
 
-	return nil, fmt.Errorf("no interface matching '%s' found.", name)
+	interfaces := make([]string, 0)
+
+	for _, iface := range ifaces {
+		interfaces = append(interfaces, iface.Name+", "+getInterfaceName(iface)+", "+iface.HardwareAddr.String())
+	}
+
+	return nil, fmt.Errorf("no interface matching '%s' found, available interfaces: \n%v", name, strings.Join(interfaces, "\n"))
 }
 
 func FindInterface(name string) (*Endpoint, error) {

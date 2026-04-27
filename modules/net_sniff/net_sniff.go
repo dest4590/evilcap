@@ -76,6 +76,17 @@ func NewSniffer(s *session.Session) *Sniffer {
 			return mod.Stats.Print()
 		}))
 
+	mod.AddHandler(session.NewModuleHandler("net.sniff stats clear", "",
+		"Reset sniffer statistics counters.",
+		func(args []string) error {
+			if mod.Stats == nil {
+				return fmt.Errorf("no stats to clear.")
+			}
+			mod.Stats = NewSnifferStats()
+			mod.Info("sniffer statistics cleared.")
+			return nil
+		}))
+
 	mod.AddHandler(session.NewModuleHandler("net.sniff on", "",
 		"Start network sniffer in background.",
 		func(args []string) error {
@@ -181,6 +192,9 @@ func (mod *Sniffer) Start() error {
 	return mod.SetRunning(true, func() {
 		mod.Stats = NewSnifferStats()
 
+		// expose live stats to the REST API session state
+		mod.State.Store("stats", mod.Stats)
+
 		src := gopacket.NewPacketSource(mod.Ctx.Handle, mod.Ctx.Handle.LinkType())
 		mod.pktSourceChan = src.Packets()
 
@@ -200,6 +214,9 @@ func (mod *Sniffer) Start() error {
 			}
 			mod.Stats.LastPacket = now
 
+			pktLen := uint64(len(packet.Data()))
+			mod.Stats.BytesSeen += pktLen
+
 			isLocal := mod.isLocalPacket(packet)
 			if isLocal {
 				mod.Stats.NumLocal++
@@ -213,6 +230,7 @@ func (mod *Sniffer) Start() error {
 				data := packet.Data()
 				if mod.Ctx.Compiled == nil || mod.Ctx.Compiled.Match(data) {
 					mod.Stats.NumMatched++
+					mod.Stats.BytesMatched += pktLen
 
 					mod.onPacketMatched(packet)
 
