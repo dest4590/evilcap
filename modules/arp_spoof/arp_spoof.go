@@ -29,6 +29,7 @@ type ArpSpoofer struct {
 	skipRestore bool
 	gratuitous  bool
 	random      bool
+	verbose     bool
 	interval    time.Duration
 	waitGroup   *sync.WaitGroup
 	targetMu    sync.RWMutex
@@ -47,6 +48,7 @@ func NewArpSpoofer(s *session.Session) *ArpSpoofer {
 		skipRestore:   false,
 		gratuitous:    false,
 		random:        false,
+		verbose:       false,
 		interval:      1 * time.Second,
 		waitGroup:     &sync.WaitGroup{},
 	}
@@ -76,6 +78,10 @@ func NewArpSpoofer(s *session.Session) *ArpSpoofer {
 	mod.AddParam(session.NewBoolParameter("arp.spoof.random",
 		"false",
 		"If true, a random delay will be added to the interval to make the spoofing less predictable."))
+
+	mod.AddParam(session.NewBoolParameter("arp.spoof.verbose",
+		"false",
+		"If true, the spoofer will print a message every time it sends a spoofed packet."))
 
 	noRestore := session.NewBoolParameter("arp.spoof.skip_restore",
 		"false",
@@ -149,15 +155,15 @@ func NewArpSpoofer(s *session.Session) *ArpSpoofer {
 	return mod
 }
 
-func (mod ArpSpoofer) Name() string {
+func (mod *ArpSpoofer) Name() string {
 	return "arp.spoof"
 }
 
-func (mod ArpSpoofer) Description() string {
+func (mod *ArpSpoofer) Description() string {
 	return "Keep spoofing selected hosts on the network."
 }
 
-func (mod ArpSpoofer) Author() string {
+func (mod *ArpSpoofer) Author() string {
 	return "Simone Margaritelli <evilsocket@gmail.com>"
 }
 
@@ -174,6 +180,8 @@ func (mod *ArpSpoofer) Configure() error {
 	} else if err, mod.gratuitous = mod.BoolParam("arp.spoof.gratuitous"); err != nil {
 		return err
 	} else if err, mod.random = mod.BoolParam("arp.spoof.random"); err != nil {
+		return err
+	} else if err, mod.verbose = mod.BoolParam("arp.spoof.verbose"); err != nil {
 		return err
 	} else if err, targets = mod.StringParam("arp.spoof.targets"); err != nil {
 		return err
@@ -384,7 +392,11 @@ func (mod *ArpSpoofer) arpSpoofTargets(saddr net.IP, smac net.HardwareAddr, chec
 			if err, pkt := packets.NewARPReply(saddr, smac, rawIP, mac); err != nil {
 				mod.Error("error while creating ARP spoof packet for %s: %s", ip, err)
 			} else {
-				mod.Debug("sending %d bytes of ARP packet to %s:%s.", len(pkt), ip, mac.String())
+				if mod.verbose {
+					mod.Info("sending %d bytes of ARP packet to %s:%s.", len(pkt), ip, mac.String())
+				} else {
+					mod.Debug("sending %d bytes of ARP packet to %s:%s.", len(pkt), ip, mac.String())
+				}
 				mod.Session.Queue.Send(pkt)
 			}
 
@@ -393,14 +405,22 @@ func (mod *ArpSpoofer) arpSpoofTargets(saddr net.IP, smac net.HardwareAddr, chec
 				gwPacket := []byte(nil)
 
 				if isSpoofing {
-					mod.Debug("telling the gw we are %s", ip)
+					if mod.verbose {
+						mod.Info("telling the gw we are %s", ip)
+					} else {
+						mod.Debug("telling the gw we are %s", ip)
+					}
 					// we told the target we're te gateway, not let's tell the
 					// gateway that we are the target
 					if err, gwPacket = packets.NewARPReply(rawIP, ourHW, gwIP, gwHW); err != nil {
 						mod.Error("error while creating ARP spoof packet: %s", err)
 					}
 				} else {
-					mod.Debug("telling the gw %s is %s", ip, mac)
+					if mod.verbose {
+						mod.Info("telling the gw %s is %s", ip, mac)
+					} else {
+						mod.Debug("telling the gw %s is %s", ip, mac)
+					}
 					// send the gateway the original MAC of the target
 					if err, gwPacket = packets.NewARPReply(rawIP, mac, gwIP, gwHW); err != nil {
 						mod.Error("error while creating ARP spoof packet: %s", err)
@@ -408,7 +428,11 @@ func (mod *ArpSpoofer) arpSpoofTargets(saddr net.IP, smac net.HardwareAddr, chec
 				}
 
 				if gwPacket != nil {
-					mod.Debug("sending %d bytes of ARP packet to the gateway", len(gwPacket))
+					if mod.verbose {
+						mod.Info("sending %d bytes of ARP packet to the gateway", len(gwPacket))
+					} else {
+						mod.Debug("sending %d bytes of ARP packet to the gateway", len(gwPacket))
+					}
 					if err = mod.Session.Queue.Send(gwPacket); err != nil {
 						mod.Error("error while sending packet: %v", err)
 					}
